@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import logging
 
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
+
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
 from lm_eval.models.utils import Collator
-from tqdm import tqdm
-from typing import Sequence
+
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +26,7 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
         self,
         pretrained: str,
         max_length: int | None = None,
-        batch_size: int | str | None = 1,
-        max_batch_size: int | None = 64,
-        ep: str = "follow_config"
+        ep: str = "follow_config",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -38,18 +39,8 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
         self.model = og.Model(self.config)
         self.tokenizer = og.Tokenizer(self.model)
 
-        self.max_length = max_length if max_length is not None else self.config.search.max_length
-        self.max_batch_size = max_batch_size or 64
-        batch_size = batch_size or 1
-        if str(batch_size).startswith("auto"):
-            batch_size = batch_size.split(":")
-            self.batch_size = batch_size[0]
-            self.batch_schedule = float(batch_size[1]) if len(batch_size) > 1 else 1
-        else:
-            self.batch_size = int(batch_size)
-
         self.params = og.GeneratorParams(self.model)
-        self.params.set_search_options(batch_size=self.batch_size, max_length=self.max_length)
+        self.params.set_search_options(max_length=self.max_length, past_present_share_buffer=False)
 
     @property
     def eot_token_id(self):
@@ -59,151 +50,88 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
         """Tokenize a string using the model's tokenizer and return a list of token IDs."""
         return self.tokenizer.encode(string).tolist()
 
-    def _model_call(self, input_ids: npt.NDArray) -> tuple[npt.NDArray, npt.NDArray]:
-        generator = og.Generator(self._model, self._params)
+    def _model_call(self, input_ids: list[int]) -> torch.Tensor:
+        generator = og.Generator(self.model, self.params)
         generator.append_tokens(input_ids)
+        # [1, seq, vocab]
+        return torch.from_numpy(generator.get_output("logits"))
 
-        count = input_ids.shape[0]
-        with torch.no_grad():
-            while not generator.is_done() and count < self._max_length:
-                generator.generate_next_token()
-                count += 1
-
-            logits = generator.get_logits().squeeze().squeeze().tolist()
-            tokens = generator.get_sequence(0)
-
-        log_probs = torch.nn.functional.log_softmax(torch.tensor(logits), dim=-1).numpy()
-        return logits, log_probs, tokens
-
-    def _loglikelihood_tokens(self, requests: list[LogLikelihoodInputs], **kwargs) -> list[tuple[float, bool]]:
+    def _loglikelihood_tokens(self, requests: list[LogLikelihoodInputs], disable_tqdm: bool = False, **kwargs) -> list[tuple[float, bool]]:
         def _collate(req: LogLikelihoodInputs):
-            """Define the key for the sorted method."""
-            # the negative sign on len(toks) sorts descending - this has a few advantages:
-            # - time estimates will always be over not underestimates, which is more useful for planning
-            # - to know the size of a batch when going through the list, you know the first one is always the batch
-            #   padded context length. this is useful to simplify the batching logic and more importantly to make
-            #   automatic adaptive batches much much easier to implement
-            # - any OOMs will happen right away rather than near the end
-
             toks = req[1] + req[2]
             return -len(toks), tuple(toks)
 
-        disable_tqdm = kwargs.get("disable_tqdm") or False
+        def _lookup_one_token_cont(req: LogLikelihoodInputs):
+            return req[-2] + req[-1][:-1]
 
-        result = []
-        re_ord = Collator(requests, sort_fn=_collate, group_by=None)
-        pbar = tqdm(desc="Running loglikelihood requests", total=len(requests), disable=disable_tqdm)
-        for chunk in re_ord.get_batched(n=self._batch_size):
-            _, context_enc, continuation_enc = next(iter(chunk))
+        re_ord = Collator(
+            requests,
+            sort_fn=_collate,
+            group_by="contexts",
+            group_fn=_lookup_one_token_cont,
+        )
 
-            input_ids = (context_enc + continuation_enc)[-(self._max_length + 1) :][:-1]
-            ctx_len = len(input_ids)
+        res = []
 
-            if len(context_enc) + len(continuation_enc) > (self._max_length + 1):
+        pbar = tqdm(
+            total=len(re_ord),
+            disable=disable_tqdm,
+            desc="Running loglikelihood requests",
+        )
+
+        for chunk in re_ord.get_batch(n=1):
+            request_str, ctx_tokens, cont_tokens = chunk[0]
+
+            # sanity checkes
+            assert len(ctx_tokens) > 0
+            assert len(cont_tokens) > 0
+            assert len(cont_tokens) <= self.max_length
+
+            total_len = len(ctx_tokens) + len(cont_tokens)
+            if total_len > self.max_length + 1:
                 logger.warning(
-                    "Context length (%d) + continuation length (%d) > max_length (%d). Left truncating context.",
-                    len(context_enc),
-                    len(continuation_enc),
-                    self._max_length,
+                    f"Combined length of context ({len(ctx_tokens)}) and continuation ({len(cont_tokens)}) "
+                    f"exceeds model's maximum length ({self.max_length}). "
+                    f"Truncating {total_len - (self.max_length + 1)} tokens from the left."
                 )
+            # [total - 1]
+            inp = (ctx_tokens + cont_tokens)[-self.max_length:][:-1]
 
-            input_ids = np.asarray(input_ids)
-            _, log_probs, output_tokens = self._model_call(input_ids)
+            # [1, total - 1, vocab]
+            multi_logits = F.log_softmax(self._model_call(inp), dim=-1, dtype=torch.float32)
 
-            cont_len = len(continuation_enc)
-            cont_tokens = np.asarray(continuation_enc)
-            greedy_tokens = output_tokens[ctx_len - cont_len : ctx_len]
+            contlen = len(cont_tokens)
+            # [1, contlen, vocab]
+            cont_slice = multi_logits[:, -contlen:]
+            # [1, contlen]
+            greedy_tokens = cont_slice.argmax(dim=-1)
 
-            is_greedy = (cont_tokens == greedy_tokens).all()
-            log_probs = np.take(log_probs, cont_tokens, 0)
+            for req_str, cont_toks, shared_logits in re_ord.get_cache(
+                req_str=request_string,
+                ctx_toks=ctx_tokens,
+                cont_toks=cont_tokens,
+                logits=cont_slice
+            ):
+                # [1, contlen]
+                cont_t = torch.tensor(cont_toks, dtype=torch.long).unsqueeze(0)
+                # use trailing slice since cont_t maybe be variable
+                is_exact = (greedy_tokens[:, -cont_t.shape[-1]:] == cont_t).all()
 
-            answer = (float(log_probs.sum()), bool(is_greedy))
-            result.append(answer)
+                # [1, contlen]
+                tok_lp = torch.gather(shared_logits, 2, cont_t.unsqueeze(-1)).squeeze(-1)
+                answer = (float(tok_lp.sum()), bool(is_exact))
+                res.append(answer)
 
-            pbar.update(1)
+                if req_str is not None:
+                    self.cache_hook.add_partial("loglikelihood", req_str, answer)
+
+                pbar.update(1)
 
         pbar.close()
-        return re_ord.get_original(result)
+        return re_ord.get_original(res)
 
     def loglikelihood_rolling(self, requests, disable_tqdm: bool = False) -> list[float]:
         raise NotImplementedError("Yet to be implemented!")
 
     def generate_until(self, requests, disable_tqdm: bool = False) -> list[str]:
         raise NotImplementedError("Yet to be implemented!")
-
-    def _detect_batch_size(self, requests: Sequence | None = None, pos: int = 0):
-        if requests:
-            _, context_enc, continuation_enc = requests[pos]
-            max_length = len(
-                (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1]
-            )
-            max_context_enc = len(context_enc[-(self.max_length + 1) :])
-            max_cont_enc = len(continuation_enc[-(self.max_length + 1) :])
-        else:
-            max_length = self.max_length
-            max_context_enc = max_length
-            max_cont_enc = max_length
-
-        batch_size = self.max_batch_size
-
-        def reduce_batch_size_fn():
-            nonlocal batch_size
-            batch_size = int(batch_size * 0.9)
-            return batch_size
-
-        while True:
-            if batch_size == 0:
-                return 1
-            try:
-                inputs = [[1]*length]
-
-
-        
-
-        # if OOM, then halves batch_size and tries again
-        @find_executable_batch_size(starting_batch_size=self.max_batch_size)
-        def forward_batch(batch_size: int):
-            if self.backend == "seq2seq":
-                length = max(max_context_enc, max_cont_enc)
-                batched_conts = torch.ones(
-                    (batch_size, length), device=self.device
-                ).long()
-                test_batch = torch.ones((batch_size, length), device=self.device).long()
-                call_kwargs = {
-                    "attn_mask": test_batch,
-                    "labels": batched_conts,
-                }
-            else:
-                call_kwargs = {}
-                test_batch = torch.ones(
-                    (batch_size, max_length), device=self.device
-                ).long()
-            for _ in range(5):
-                out = F.log_softmax(  # noqa: F841
-                    self._model_call(test_batch, **call_kwargs),
-                    dim=-1,
-                    dtype=self.softmax_dtype,
-                )
-
-            return batch_size
-
-        try:
-            batch_size = forward_batch()
-        except RuntimeError as e:
-            if "No executable batch size found" in str(e):
-                batch_size = 1
-            else:
-                raise
-
-        if self.world_size > 1:
-            # if multi-GPU, always take minimum over all selected batch sizes
-            max_rnk_bs = torch.tensor([batch_size], device=self.device)
-            gathered = (
-                self.accelerator.gather(max_rnk_bs).cpu().detach().numpy().tolist()
-            )
-            batch_size = min(gathered)
-            clear_torch_cache()
-            return batch_size
-
-        clear_torch_cache()
-        return batch_size
