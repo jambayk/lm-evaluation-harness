@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -39,6 +41,11 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
         self.model = og.Model(self.config)
         self.tokenizer = og.Tokenizer(self.model)
 
+        if max_length:
+            self.max_length = max_length
+        else:
+            with (Path(pretrained) / "genai_config.json").open() as f:
+                self.max_length = json.load(f)["search"]["max_length"]
         self.params = og.GeneratorParams(self.model)
         self.params.set_search_options(max_length=self.max_length, past_present_share_buffer=False)
 
@@ -79,7 +86,7 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
             desc="Running loglikelihood requests",
         )
 
-        for chunk in re_ord.get_batch(n=1):
+        for chunk in re_ord.get_batched(n=1):
             request_str, ctx_tokens, cont_tokens = chunk[0]
 
             # sanity checkes
@@ -107,8 +114,8 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
             greedy_tokens = cont_slice.argmax(dim=-1)
 
             for req_str, cont_toks, shared_logits in re_ord.get_cache(
-                req_str=request_string,
-                ctx_toks=ctx_tokens,
+                req_str=request_str,
+                cxt_toks=ctx_tokens,
                 cont_toks=cont_tokens,
                 logits=cont_slice
             ):
