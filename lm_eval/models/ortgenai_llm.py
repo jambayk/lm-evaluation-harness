@@ -29,6 +29,7 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
         pretrained: str,
         max_length: int | None = None,
         ep: str = "follow_config",
+        device: str = "cpu",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -48,6 +49,8 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
                 self.max_length = json.load(f)["search"]["max_length"]
         self.params = og.GeneratorParams(self.model)
         self.params.set_search_options(max_length=self.max_length, past_present_share_buffer=False)
+        
+        self.device = device
 
     @property
     def eot_token_id(self):
@@ -105,11 +108,11 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
             inp = (ctx_tokens + cont_tokens)[-self.max_length:][:-1]
 
             # [1, total - 1, vocab]
-            multi_logits = F.log_softmax(self._model_call(inp), dim=-1, dtype=torch.float32)
+            multi_logits = self._model_call(inp)
 
-            contlen = len(cont_tokens)
             # [1, contlen, vocab]
-            cont_slice = multi_logits[:, -contlen:]
+            cont_slice = multi_logits[:, -len(cont_tokens):, :]
+            cont_slice = F.log_softmax(cont_slice.to(self.device), dim=-1)
             # [1, contlen]
             greedy_tokens = cont_slice.argmax(dim=-1)
 
@@ -120,7 +123,7 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
                 logits=cont_slice
             ):
                 # [1, contlen]
-                cont_t = torch.tensor(cont_toks, dtype=torch.long).unsqueeze(0)
+                cont_t = torch.tensor(cont_toks, dtype=torch.long, device=self.device).unsqueeze(0)
                 # use trailing slice since cont_t maybe be variable
                 is_exact = (greedy_tokens[:, -cont_t.shape[-1]:] == cont_t).all()
 
