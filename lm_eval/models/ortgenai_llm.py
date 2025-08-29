@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
-from lm_eval.models.utils import Collator
+from lm_eval.models.utils import Collator, pad_and_concat
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,7 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
     def __init__(
         self,
         pretrained: str,
+        batch_size: int | str = 1,
         max_length: int | None = None,
         ep: str = "follow_config",
         device: str = "cpu",
@@ -42,6 +43,9 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
         self.model = og.Model(self.config)
         self.tokenizer = og.Tokenizer(self.model)
 
+        # consider adding auto batch sizes
+        self.batch_size = int(batch_size)
+        
         if max_length:
             self.max_length = max_length
         else:
@@ -60,13 +64,15 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
         """Tokenize a string using the model's tokenizer and return a list of token IDs."""
         return self.tokenizer.encode(string).tolist()
 
-    def _model_call(self, input_ids: list[int]) -> torch.Tensor:
+    def _model_call(self, input_ids: torch.Tensor) -> torch.Tensor:
+        batch_size, _ = input_ids.shape
+        self.params.set_search_options(batch_size=batch_size)
         generator = og.Generator(self.model, self.params)
-        generator.append_tokens(input_ids)
+        generator.append_tokens(input_ids.tolist())
         # [1, seq, vocab]
         return torch.from_numpy(generator.get_output("logits"))
 
-    def _loglikelihood_tokens(self, requests: list[LogLikelihoodInputs], disable_tqdm: bool = False, **kwargs) -> list[tuple[float, bool]]:
+    def _loglikelihood_tokens(self, requests: list[LogLikelihoodInputs], **kwargs) -> list[tuple[float, bool]]:
         def _collate(req: LogLikelihoodInputs):
             toks = req[1] + req[2]
             return -len(toks), tuple(toks)
@@ -85,59 +91,105 @@ class LMEvalOnnxModelEvaluator(TemplateLM):
 
         pbar = tqdm(
             total=len(re_ord),
-            disable=disable_tqdm,
-            desc="Running loglikelihood requests",
+            desc="Running loglikelihood requests"
         )
+        logger.info(f"Calculating loglikelihood for {len(re_ord)} requests")
+        for chunk in re_ord.get_batched(n=self.batch_size):
+            inps = []
+            cont_toks_list = []
+            inplens = []
 
-        for chunk in re_ord.get_batched(n=1):
-            request_str, ctx_tokens, cont_tokens = chunk[0]
+            padding_len_inp = None
 
-            # sanity checkes
-            assert len(ctx_tokens) > 0
-            assert len(cont_tokens) > 0
-            assert len(cont_tokens) <= self.max_length
+            for _, context_enc, continuation_enc in chunk:
+                # sanity check
+                assert len(context_enc) > 0
+                assert len(continuation_enc) > 0
+                assert len(continuation_enc) <= self.max_length
 
-            total_len = len(ctx_tokens) + len(cont_tokens)
-            if total_len > self.max_length + 1:
-                logger.warning(
-                    f"Combined length of context ({len(ctx_tokens)}) and continuation ({len(cont_tokens)}) "
-                    f"exceeds model's maximum length ({self.max_length}). "
-                    f"Truncating {total_len - (self.max_length + 1)} tokens from the left."
+                total_length = len(context_enc) + len(continuation_enc)
+                if total_length > self.max_length + 1:
+                    logger.warning(
+                        f"Combined length of context ({len(context_enc)}) and continuation ({len(continuation_enc)}) "
+                        f"exceeds model's maximum length ({self.max_length}). "
+                        f"Truncating {total_length - self.max_length + 1} tokens from the left."
+                    )
+                inp = torch.tensor(
+                    (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1],
+                    dtype=torch.long,
                 )
-            # [total - 1]
-            inp = (ctx_tokens + cont_tokens)[-self.max_length:][:-1]
+                (inplen,) = inp.shape
 
-            # [1, total - 1, vocab]
-            multi_logits = self._model_call(inp)
+                padding_len_inp = (
+                    max(padding_len_inp, inplen)
+                    if padding_len_inp is not None
+                    else inplen
+                )
 
-            # [1, contlen, vocab]
-            cont_slice = multi_logits[:, -len(cont_tokens):, :]
-            cont_slice = F.log_softmax(cont_slice.to(self.device), dim=-1)
-            # [1, contlen]
-            greedy_tokens = cont_slice.argmax(dim=-1)
+                inps.append(inp)  # [1, inp_length]
+                cont_toks_list.append(continuation_enc)
+                inplens.append(inplen)
 
-            for req_str, cont_toks, shared_logits in re_ord.get_cache(
-                req_str=request_str,
-                cxt_toks=ctx_tokens,
-                cont_toks=cont_tokens,
-                logits=cont_slice
+            batched_inps = pad_and_concat(
+                padding_len_inp, inps, padding_side="right"
+            )  # [batch, padding_len_inp]
+
+            multi_logits = self._model_call(batched_inps) # [batch, padding_length (inp or cont), vocab]
+
+            for (request_str, ctx_tokens, _), logits, inplen, cont_toks in zip(
+                chunk, multi_logits, inplens, cont_toks_list
             ):
-                # [1, contlen]
-                cont_t = torch.tensor(cont_toks, dtype=torch.long, device=self.device).unsqueeze(0)
-                # use trailing slice since cont_t maybe be variable
-                is_exact = (greedy_tokens[:, -cont_t.shape[-1]:] == cont_t).all()
+                # Slice to original seq length
+                contlen = len(cont_toks)
+                # take only logits in the continuation
+                # (discard context toks if decoder-only ; discard right-padding)
+                # also discards + checks for "virtual tokens" in the causal LM's input window
+                # from prompt/prefix tuning tokens, if applicable
+                ctx_len = inplen + (logits.shape[0] - padding_len_inp)
+                logits = logits[ctx_len - contlen : ctx_len]
+                logits = logits.unsqueeze(0) # [1, seq, vocab]
+                logits = F.log_softmax(logits.to(self.device), dim=-1)
 
-                # [1, contlen]
-                tok_lp = torch.gather(shared_logits, 2, cont_t.unsqueeze(-1)).squeeze(-1)
-                answer = (float(tok_lp.sum()), bool(is_exact))
-                res.append(answer)
+                greedy_tokens = logits.argmax(dim=-1)
 
-                if req_str is not None:
-                    self.cache_hook.add_partial("loglikelihood", req_str, answer)
+                for request_str, cont_toks, logits in re_ord.get_cache(  # noqa
+                    req_str=request_str,
+                    cxt_toks=ctx_tokens,
+                    cont_toks=cont_toks,
+                    logits=logits,
+                ):
+                    cont_toks = torch.tensor(
+                        cont_toks, dtype=torch.long, device=self.device
+                    ).unsqueeze(0)  # [1, seq]
+                    # Use trailing slice [-cont_toks.shape[1]:] to handle variable length cont_len (but same ctx+cont[:-1]).
+                    # i.e. continuations can be sliced at diff points. Collator ensures we have sufficient greedy_tokens
+                    # by choosing key with longest cont if group_by="contexts".
+                    max_equal = (
+                        greedy_tokens[:, -cont_toks.shape[1] :] == cont_toks
+                    ).all()
 
-                pbar.update(1)
+                    # Obtain log-probs at the corresponding continuation token indices
+                    # last_token_slice = logits[:, -1, :].squeeze(0).tolist()
+                    logits = torch.gather(logits, 2, cont_toks.unsqueeze(-1)).squeeze(
+                        -1
+                    )  # [1, seq]
+
+                    # Answer: (log prob, is-exact-match)
+                    answer = (float(logits.sum()), bool(max_equal))
+
+                    res.append(answer)
+
+                    if request_str is not None:
+                        # special case: loglikelihood_rolling produces a number of loglikelihood requests
+                        # all with cache key None. instead do add_partial on the per-example level
+                        # in the loglikelihood_rolling() function for those.
+                        self.cache_hook.add_partial(
+                            "loglikelihood", request_str, answer
+                        )
+                    pbar.update(1)
 
         pbar.close()
+
         return re_ord.get_original(res)
 
     def loglikelihood_rolling(self, requests, disable_tqdm: bool = False) -> list[float]:
