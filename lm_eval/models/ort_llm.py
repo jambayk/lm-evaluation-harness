@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 import re
@@ -31,12 +30,13 @@ class LMEvalORTEvaluator(TemplateLM):
         batch_size: int | str = 1,
         max_length: int | None = None,
         ep: str | None = None,
+        ep_options: str | None = None,
         add_bos_token: bool | None = False,
         **kwargs,
     ) -> None:
         super().__init__()
 
-        self.prefill = Prefill(model_path, ep)
+        self.prefill = Prefill(model_path, ep, ep_options)
         self.config = AutoConfig.from_pretrained(Path(model_path).parent)
         self.tokenizer = AutoTokenizer.from_pretrained(Path(model_path).parent)
 
@@ -86,18 +86,6 @@ class LMEvalORTEvaluator(TemplateLM):
 
         return encoding
 
-    def _model_call(self, input_ids: torch.Tensor) -> torch.Tensor:
-
-
-
-
-        batch_size, _ = input_ids.shape
-        self.params.set_search_options(batch_size=batch_size)
-        generator = og.Generator(self.model, self.params)
-        generator.append_tokens(input_ids.tolist())
-        # [1, seq, vocab]
-        return torch.from_numpy(generator.get_output("logits"))
-
     def _loglikelihood_tokens(self, requests: list[LogLikelihoodInputs], **kwargs) -> list[tuple[float, bool]]:
         def _collate(req: LogLikelihoodInputs):
             toks = req[1] + req[2]
@@ -108,9 +96,8 @@ class LMEvalORTEvaluator(TemplateLM):
 
         max_length = -1
         for _, context_enc, continuation_enc in requests:
-            max_length = max(max_length, len(context_enc) + len(continuation_enc))
+            max_length = max(max_length, len(context_enc) + len(continuation_enc)-1)
         max_length = min(max_length, self.max_length)
-        print(max_length)
         self.prefill.initialize_buffers(self.batch_size, max_length)
 
         re_ord = Collator(
@@ -233,7 +220,7 @@ class LMEvalORTEvaluator(TemplateLM):
         raise NotImplementedError("Yet to be implemented!")
 
 class Prefill:
-    def __init__(self, model_path: str, ep: str):
+    def __init__(self, model_path: str, ep: str, ep_options: str | None):
         import onnx 
         from olive.model.utils.onnx_utils import get_additional_file_path, get_io_config
 
@@ -242,6 +229,10 @@ class Prefill:
         if ep == "CUDAExecutionProvider" and not torch.cuda.is_available():
             raise RuntimeError("CUDAExecutionProvider requires torch.cuda to be available")
         self.ep = ep
+        self.ep_options = {}
+        for option in (ep_options or "").split(";"):
+            key, value = option.split(":")
+            self.ep_options[key] = value
         self.device = "cuda" if ep == "CUDAExecutionProvider" else "cpu"
 
         self.io_dtypes = self.get_io_dtypes(self.io_config)
@@ -265,6 +256,9 @@ class Prefill:
         inputs_to_bind = {
             "input_ids": (input_ids.to(device=self.device, dtype=getattr(torch, self.io_dtypes["input_ids"])).contiguous(), self.io_dtypes["input_ids"], (batch_size, seqlen)),
         }
+        if "past_seq_len" in self._buffers["inputs"]:
+            self._buffers["inputs"]["past_seq_len"][:] = seqlen - 1
+            self._buffers["inputs"]["total_seq_len"][:] = seqlen
         for name, shape in [("attention_mask", (batch_size, seqlen)), ("past_seq_len", (batch_size,1)), ("total_seq_len", (1,))]:
             if name not in self._buffers["inputs"]:
                 continue
@@ -315,7 +309,11 @@ class Prefill:
         if self._session is not None:
             return self._session
 
-        self._session = InferenceSession(self.model_path, providers=[self.ep] if self.ep else None)
+        self._session = InferenceSession(
+            self.model_path, 
+            providers=[self.ep] if self.ep else None, 
+            provider_options=[self.ep_options] if self.ep_options else None
+        )
         return self._session
 
     def reset_buffers(self):
@@ -336,7 +334,7 @@ class Prefill:
             inputs["position_ids"] = torch.arange(max_length, dtype=getattr(torch, self.io_dtypes["position_ids"]), device=self.device).unsqueeze(0).expand(batch_size, -1)
         if self.io_dtypes["past_seq_len"] is not None:
             inputs["past_seq_len"] = torch.tensor(max_length-1, dtype=getattr(torch, self.io_dtypes["past_seq_len"]), device=self.device).unsqueeze(0).expand(batch_size, -1)
-            inputs["total_seq_len"] = torch.tensor(max_length, dtype=getattr(torch, self.io_dtypes["total_seq_len"]), device=self.device)
+            inputs["total_seq_len"] = torch.tensor(max_length, dtype=getattr(torch, self.io_dtypes["total_seq_len"]), device=self.device).unsqueeze(0)
 
         # outputs other than kv cache
         outputs = {
