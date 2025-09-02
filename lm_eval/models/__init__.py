@@ -14,6 +14,7 @@ from . import (
     openai_completions,
     optimum_ipex,
     optimum_lm,
+    ort_llm,
     ortgenai_llm,
     sglang_causallms,
     sglang_generate_API,
